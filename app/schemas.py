@@ -140,6 +140,26 @@ class ProjectAssistantHistoryResponse(BaseModel):
     messages: list[ProjectAssistantMessage]
 
 # ---------------------------------------------------------
+# Project Documents
+# ---------------------------------------------------------    
+    
+class ProjectDocumentCreate(BaseModel):
+    title: str
+    content: str
+
+
+class ProjectDocumentRead(BaseModel):
+    id: UUID
+    project_id: UUID
+    title: str
+    content: str
+    created_at: datetime
+    created_by_id: UUID | None = None
+
+    class Config:
+        from_attributes = True    
+
+# ---------------------------------------------------------
 # INVITE CREATION (PM sends)
 # ---------------------------------------------------------
 

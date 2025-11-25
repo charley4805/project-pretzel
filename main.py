@@ -1,7 +1,9 @@
 import secrets
+import asyncio
 from datetime import datetime, timezone
 from uuid import UUID
 from typing import List, Optional
+from fastapi.responses import StreamingResponse
 
 from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,8 +21,7 @@ from app.auth_utils import (
     decode_access_token,
 )
 
-# 👉 Import your compiled LangGraph
-from app.graph import app_graph  # rename to `from graph import app_graph` if you rename the file
+from app.graph import app_graph  
 
 
 app = FastAPI()
@@ -88,6 +89,43 @@ def get_current_user(
 
     return user
 
+
+def get_current_user_optional(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(default=None),
+) -> Optional[models.User]:
+    """
+    Like get_current_user, but returns None if there's no valid Bearer token
+    instead of raising 401/403. Useful for endpoints that are public for
+    global use, but project-specific access can still require auth.
+    """
+    if not authorization:
+        return None
+
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+
+    token = parts[1]
+    payload = decode_access_token(token)
+    if not payload or "sub" not in payload:
+        return None
+
+    try:
+        user_id = UUID(payload["sub"])
+    except ValueError:
+        return None
+
+    user = (
+        db.query(models.User)
+        .filter(models.User.id == user_id)
+        .first()
+    )
+
+    if not user or not user.is_active:
+        return None
+
+    return user
 
 # ---------- BASIC ROUTES ----------
 
@@ -705,6 +743,108 @@ def approve_invite_and_assign_role(
         message=f'User "{user.full_name or user.email or user.phone_number}" has been added to project "{project.name}" as {role.name}.',
     )
 
+# ---------- PROJECT DOCUMENTS (for RAG) ----------
+
+@app.post(
+    "/projects/{project_id}/documents",
+    response_model=schemas.ProjectDocumentRead,
+)
+def create_project_document(
+    project_id: UUID,
+    payload: schemas.ProjectDocumentCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Create a simple text document attached to a project.
+
+    For now we restrict this to PROJECT_MANAGER. Later we can expand.
+    """
+    # Ensure project exists
+    project = (
+        db.query(models.Project)
+        .filter(models.Project.id == project_id)
+        .first()
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    # Ensure caller is at least a member of this project
+    membership_row = (
+        db.query(models.ProjectMember, models.Role)
+        .outerjoin(models.Role, models.ProjectMember.role_id == models.Role.id)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if not membership_row:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not a member of this project.",
+        )
+
+    membership, role = membership_row
+
+    # Only PM can create documents for now
+    if not role or role.key != "PROJECT_MANAGER":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the Project Manager can add documents to this project.",
+        )
+
+    doc = models.ProjectDocument(
+        project_id=project_id,
+        title=payload.title,
+        content=payload.content,
+        created_by_id=current_user.id,
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+
+    return schemas.ProjectDocumentRead.model_validate(doc)
+
+
+@app.get(
+    "/projects/{project_id}/documents",
+    response_model=list[schemas.ProjectDocumentRead],
+)
+def list_project_documents(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    List documents for a project.
+    Any project member can see the list for now.
+    """
+    # Ensure caller is a member
+    membership = (
+        db.query(models.ProjectMember)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not membership:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not a member of this project.",
+        )
+
+    docs = (
+        db.query(models.ProjectDocument)
+        .filter(models.ProjectDocument.project_id == project_id)
+        .order_by(models.ProjectDocument.created_at.desc())
+        .all()
+    )
+
+    return [schemas.ProjectDocumentRead.model_validate(d) for d in docs]
+
 
 # ---------- CHAT HELPERS (LangGraph glue) ----------
 
@@ -731,43 +871,81 @@ def extract_latest_assistant_reply(messages: List[str]) -> str:
     return "Sorry, I couldn't generate a response."
 
 
-# ---------- CHAT ROUTE (now powered by LangGraph) ----------
+# ---------- CHAT ROUTE (role-aware + LangGraph) ----------
+
+# ---------- CHAT ROUTE (role-aware + LangGraph) ----------
 
 @app.post("/chat")
 async def chat(
     req: ChatRequest,
     db: Session = Depends(get_db),
-    current_user: Optional[models.User] = Depends(get_current_user),
+    current_user: Optional[models.User] = Depends(get_current_user_optional),
 ):
     """
     Chat endpoint used by the frontend AI Assistant.
 
-    Request:
-      {
-        "message": "string",
-        "history": ["USER: ...", "ASSISTANT: ..."],
-        "projectId": "uuid-string | null"
-      }
-
-    Response:
-      {
-        "reply": "assistant message text",
-        "messages": ["USER: ...", "ASSISTANT: ...", ...],
-        "projectId": "...",
-        "userId": "..."
-      }
+    - If projectId is provided, user must be a member of that project
+    - Looks up their role in that project
+    - Passes messages + projectId + userId + roleKey into LangGraph
     """
+    project_uuid: Optional[UUID] = None
+    role_key: Optional[str] = None
+
+    # --- Project + role resolution (only if projectId is provided) ---
+    if req.projectId:
+        if not current_user:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required to chat in a project.",
+            )
+
+        try:
+            project_uuid = UUID(req.projectId)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid projectId format.")
+
+        project = (
+            db.query(models.Project)
+            .filter(models.Project.id == project_uuid)
+            .first()
+        )
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found.")
+
+        membership_row = (
+            db.query(models.ProjectMember, models.Role)
+            .outerjoin(models.Role, models.ProjectMember.role_id == models.Role.id)
+            .filter(
+                models.ProjectMember.project_id == project_uuid,
+                models.ProjectMember.user_id == current_user.id,
+            )
+            .first()
+        )
+
+        if not membership_row:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not a member of this project.",
+            )
+
+        membership, role = membership_row
+        role_key = role.key if role else None
+
+    # --- Prepare messages for the graph ---
+    messages_for_graph = append_user_turn(req.history, req.message)
+
+    # --- Invoke LangGraph with role-aware state ---
     try:
-        # 1) Append the current user message in the same string format your graph expects
-        messages_for_graph = append_user_turn(req.history, req.message)
+        result_state = app_graph.invoke(
+            {
+                "messages": messages_for_graph,
+                "projectId": str(project_uuid) if project_uuid else None,
+                "userId": str(current_user.id) if current_user else None,
+                "roleKey": role_key,
+            }
+        )
 
-        # 2) Invoke the compiled LangGraph agent (router + tools + assistant)
-        result_state = app_graph.invoke({"messages": messages_for_graph,"projectId": req.projectId,})
-
-        # 3) Get back the full conversation list (your nodes already append ASSISTANT messages)
         updated_history: List[str] = result_state.get("messages", messages_for_graph)
-
-        # 4) Extract the latest assistant reply for convenience in the frontend
         reply_text = extract_latest_assistant_reply(updated_history)
 
         return {
@@ -775,7 +953,97 @@ async def chat(
             "messages": updated_history,
             "projectId": req.projectId,
             "userId": str(current_user.id) if current_user else None,
+            "roleKey": role_key,
         }
 
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------- CHAT ROUTE (streaming text response) ----------
+
+@app.post("/chat/stream")
+async def chat_stream(
+    req: ChatRequest,
+    db: Session = Depends(get_db),
+    current_user: Optional[models.User] = Depends(get_current_user_optional),
+):
+    """
+    Streaming chat endpoint.
+
+    Uses the same LangGraph pipeline as /chat, but returns the assistant's
+    reply as a text stream so the UI can show it "typing".
+    """
+    project_uuid: Optional[UUID] = None
+    role_key: Optional[str] = None
+
+    # --- Project + role resolution only if projectId is provided ---
+    if req.projectId:
+        if not current_user:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required to chat in a project.",
+            )
+
+        try:
+            project_uuid = UUID(req.projectId)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid projectId format.")
+
+        project = (
+            db.query(models.Project)
+            .filter(models.Project.id == project_uuid)
+            .first()
+        )
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found.")
+
+        membership_row = (
+            db.query(models.ProjectMember, models.Role)
+            .outerjoin(models.Role, models.ProjectMember.role_id == models.Role.id)
+            .filter(
+                models.ProjectMember.project_id == project_uuid,
+                models.ProjectMember.user_id == current_user.id,
+            )
+            .first()
+        )
+
+        if not membership_row:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not a member of this project.",
+            )
+
+        membership, role = membership_row
+        role_key = role.key if role else None
+
+    # --- Prepare messages for the graph ---
+    messages_for_graph = append_user_turn(req.history, req.message)
+
+    # --- Run LangGraph once to get full reply + updated messages ---
+    try:
+        result_state = app_graph.invoke(
+            {
+                "messages": messages_for_graph,
+                "projectId": str(project_uuid) if project_uuid else None,
+                "userId": str(current_user.id) if current_user else None,
+                "roleKey": role_key,
+            }
+        )
+
+        updated_history: List[str] = result_state.get("messages", messages_for_graph)
+        reply_text = extract_latest_assistant_reply(updated_history)
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    async def text_stream():
+        chunk_size = 32
+        for i in range(0, len(reply_text), chunk_size):
+            chunk = reply_text[i : i + chunk_size]
+            yield chunk
+            await asyncio.sleep(0)
+
+    return StreamingResponse(text_stream(), media_type="text/plain; charset=utf-8")
+
+

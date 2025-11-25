@@ -1,14 +1,16 @@
 import uuid
+from datetime import datetime
+
 from sqlalchemy import (
-    Column,
-    String,
-    DateTime,
-    ForeignKey,
-    Text,
-    Enum,
-    JSON,
-    Integer,
     Boolean,
+    Column,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
     UniqueConstraint,
     text,
 )
@@ -19,6 +21,7 @@ from app.database import Base
 
 
 # ---------- CORE USER / PROJECT MODELS ----------
+
 
 class User(Base):
     __tablename__ = "users"
@@ -53,7 +56,6 @@ class User(Base):
     )
 
 
-
 class Project(Base):
     __tablename__ = "projects"
 
@@ -79,6 +81,7 @@ class Project(Base):
 
 
 # ---------- ROLES & PERMISSIONS ----------
+
 
 class Permission(Base):
     """
@@ -115,7 +118,7 @@ class Role(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     key = Column(String(100), unique=True, nullable=False, index=True)  # machine key: "PROJECT_MANAGER"
-    name = Column(String(100), nullable=False)                          # human label: "Project Manager"
+    name = Column(String(100), nullable=False)  # human label: "Project Manager"
     description = Column(Text, nullable=True)
     sort_order = Column(Integer, default=0)
 
@@ -205,6 +208,7 @@ class AIRunLog(Base):
     project = relationship("Project", back_populates="ai_runs")
     user = relationship("User", back_populates="ai_runs")
 
+
 class ProjectInvite(Base):
     """
     Invitation flow:
@@ -242,3 +246,17 @@ class ProjectInvite(Base):
     project = relationship("Project", back_populates="invites")
     inviter = relationship("User", foreign_keys=[inviter_id], back_populates="sent_invites")
     invitee_user = relationship("User", foreign_keys=[invitee_user_id], back_populates="received_invites")
+
+
+class ProjectDocument(Base):
+    __tablename__ = "project_documents"
+
+    id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(PGUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False)
+    title = Column(String(255), nullable=False)
+    content = Column(Text, nullable=False)  # plain text RAG source
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_by_id = Column(PGUUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+
+    project = relationship("Project", backref="documents")
+    created_by = relationship("User", backref="created_documents")

@@ -7,10 +7,9 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 
-# 🔹 NEW: we now need DB + models for project-aware tools
 from sqlalchemy.orm import Session
 from app.database import SessionLocal
-from app.models import Project, ProjectMember, Role
+from app.models import Project, ProjectMember, Role, ProjectDocument
 
 
 # Load environment variables once when this module is imported
@@ -29,9 +28,12 @@ if not OPENAI_API_KEY:
 class ChatState(TypedDict):
     # Conversation history in "USER: ..." / "ASSISTANT: ..." format
     messages: List[str]
-    # 🔹 NEW: active projectId so tools can be project-aware
+    # Active project this chat is about (UUID as string)
     projectId: Optional[str]
-
+    # 🔹 NEW: who is asking
+    userId: Optional[str]
+    # 🔹 NEW: their role in that project (e.g., "PROJECT_MANAGER")
+    roleKey: Optional[str]
 
 # Create LLM client (shared by all nodes)
 llm = ChatOpenAI(
@@ -345,7 +347,29 @@ def material_cost_node(state: ChatState) -> ChatState:
     Estimate material cost based on:
       - board-foot dimensions + price per bf
       - OR quantity + price per unit (sheets/boards/etc.)
+
+    Role-aware behavior:
+      - PROJECT_MANAGER and ESTIMATOR roles get full cost breakdown
+      - Others are told that detailed cost visibility is restricted
     """
+    role_key = state.get("roleKey")
+
+    allowed_roles_for_cost = {"PROJECT_MANAGER", "ESTIMATOR"}
+    if role_key not in allowed_roles_for_cost:
+        reply = (
+            "I can help you with quantities and measurements, but detailed "
+            "material cost estimates are restricted to the Project Manager "
+            "or Estimator. Please ask them for the exact cost breakdown."
+        )
+        return {
+            "messages": state["messages"] + [f"ASSISTANT: {reply}"],
+            "projectId": state.get("projectId"),
+            "userId": state.get("userId"),
+            "roleKey": role_key,
+        }
+
+    # --- existing cost logic below this line ---
+
     last = state["messages"][-1]
     if last.lower().startswith("user:"):
         text = last[5:].strip()
@@ -417,7 +441,12 @@ def material_cost_node(state: ChatState) -> ChatState:
             )
 
     new_messages = state["messages"] + [f"ASSISTANT: {reply}"]
-    return {"messages": new_messages, "projectId": state.get("projectId")}
+    return {
+        "messages": new_messages,
+        "projectId": state.get("projectId"),
+        "userId": state.get("userId"),
+        "roleKey": role_key,
+    }
 
 
 # ---------- Assistant Node (general chat) ----------
@@ -446,9 +475,13 @@ def assistant_node(state: ChatState) -> ChatState:
 def project_info_node(state: ChatState) -> ChatState:
     """
     Returns a summary of the project based on projectId inside the state.
-    Useful for PMs or members asking for 'project summary', 'overview', etc.
+    Behavior varies by role:
+      - PROJECT_MANAGER: full overview including members
+      - Others: basic project info, limited team details
     """
     project_id = state.get("projectId")
+    role_key = state.get("roleKey")
+
     if not project_id:
         reply = (
             "I can summarize the project, but no projectId was provided. "
@@ -457,6 +490,8 @@ def project_info_node(state: ChatState) -> ChatState:
         return {
             "messages": state["messages"] + [f"ASSISTANT: {reply}"],
             "projectId": project_id,
+            "userId": state.get("userId"),
+            "roleKey": role_key,
         }
 
     db: Session = SessionLocal()
@@ -470,36 +505,146 @@ def project_info_node(state: ChatState) -> ChatState:
             return {
                 "messages": state["messages"] + [f"ASSISTANT: {reply}"],
                 "projectId": project_id,
+                "userId": state.get("userId"),
+                "roleKey": role_key,
             }
 
+        # Fetch members
         project_members = (
             db.query(ProjectMember)
             .filter(ProjectMember.project_id == project_id)
             .all()
         )
 
-        member_lines = []
-        for pm in project_members:
-            role_name = pm.role.name if getattr(pm, "role", None) else "No role assigned"
-            member_lines.append(f"- {role_name} (user id: {pm.user_id})")
+        # Decide if this role can see full team details
+        privileged_roles = {"PROJECT_MANAGER"}  # expand later as needed
+        can_view_full_team = role_key in privileged_roles
 
-        member_block = "\n".join(member_lines) if member_lines else "No members found."
+        if can_view_full_team:
+            member_lines = []
+            for pm in project_members:
+                role_name = pm.role.name if getattr(pm, "role", None) else "No role assigned"
+                member_lines.append(f"- {role_name} (user id: {pm.user_id})")
 
-        reply = (
-            f"Project Overview:\n"
-            f"Name: {project.name}\n"
-            f"Description: {project.description or 'No description provided.'}\n"
-            f"Status: {project.status}\n"
-            f"Members:\n{member_block}"
-        )
+            member_block = "\n".join(member_lines) if member_lines else "No members found."
+
+            reply = (
+                f"Project Overview (PM view):\n"
+                f"Name: {project.name}\n"
+                f"Description: {project.description or 'No description provided.'}\n"
+                f"Status: {project.status}\n"
+                f"Members:\n{member_block}"
+            )
+        else:
+            # Non-PM roles get basic info only
+            reply = (
+                f"Project Overview:\n"
+                f"Name: {project.name}\n"
+                f"Description: {project.description or 'No description provided.'}\n"
+                f"Status: {project.status}\n"
+                "Team details are limited based on your role. "
+                "Ask your Project Manager if you need more information."
+            )
     finally:
         db.close()
 
     return {
         "messages": state["messages"] + [f"ASSISTANT: {reply}"],
         "projectId": project_id,
+        "userId": state.get("userId"),
+        "roleKey": role_key,
     }
 
+def document_search_node(state: ChatState) -> ChatState:
+    """
+    RAG-lite node: search project documents and answer using their content.
+
+    - Requires projectId in state
+    - Searches title/content with a simple ILIKE text search
+    - Feeds top matches into the LLM along with the user's question
+    """
+    project_id = state.get("projectId")
+    role_key = state.get("roleKey")
+    user_id = state.get("userId")
+
+    last = state["messages"][-1]
+    if last.lower().startswith("user:"):
+        query_text = last[5:].strip()
+    else:
+        query_text = last
+
+    if not project_id:
+        reply = (
+            "I can search project documents, but no projectId was provided. "
+            "Try asking again from inside an active project."
+        )
+        return {
+            "messages": state["messages"] + [f"ASSISTANT: {reply}"],
+            "projectId": project_id,
+            "userId": user_id,
+            "roleKey": role_key,
+        }
+
+    db: Session = SessionLocal()
+    try:
+        # Basic text search against project documents
+        q = (
+            db.query(ProjectDocument)
+            .filter(ProjectDocument.project_id == project_id)
+            .filter(
+                (ProjectDocument.title.ilike(f"%{query_text}%"))
+                | (ProjectDocument.content.ilike(f"%{query_text}%"))
+            )
+            .order_by(ProjectDocument.created_at.desc())
+            .limit(5)
+        )
+
+        docs = q.all()
+
+        if not docs:
+            reply = (
+                "I searched the project documents but couldn't find anything clearly "
+                "related to your question. Try rephrasing or adding more detail."
+            )
+            return {
+                "messages": state["messages"] + [f"ASSISTANT: {reply}"],
+                "projectId": project_id,
+                "userId": user_id,
+                "roleKey": role_key,
+            }
+
+        # Build a context string from the top documents
+        context_chunks = []
+        for idx, d in enumerate(docs, start=1):
+            snippet = d.content[:600]  # first 600 chars
+            context_chunks.append(
+                f"Document {idx} - {d.title}:\n{snippet}\n"
+            )
+
+        context_text = "\n\n".join(context_chunks)
+
+        prompt = (
+            "You are an AI assistant helping with a construction project. "
+            "Use ONLY the following project documents to answer the user's question. "
+            "If the documents do not contain the answer, say you couldn't find "
+            "anything definitive in the project documents.\n\n"
+            f"User's question:\n{query_text}\n\n"
+            f"Project documents:\n{context_text}\n\n"
+            "Now provide a concise, helpful answer referencing the documents when appropriate."
+        )
+
+        response = llm.invoke(prompt)
+        ai_reply = response.content
+
+        return {
+            "messages": state["messages"] + [f"ASSISTANT: {ai_reply}"],
+            "projectId": project_id,
+            "userId": user_id,
+            "roleKey": role_key,
+        }
+
+    finally:
+        db.close()
 
 
 # ---------- Router Node + Routing Logic ----------
@@ -544,6 +689,23 @@ def route_from_text(state: ChatState) -> str:
     ]
     if any(k in text for k in project_keywords):
         return "project_info"
+
+    doc_keywords = [
+        "spec",
+        "specs",
+        "specification",
+        "document",
+        "documents",
+        "docs",
+        "plans",
+        "blueprint",
+        "rfis",
+        "rfi",
+        "change order",
+        "submittal",
+    ]
+    if any(k in text for k in doc_keywords):
+        return "doc_search"
 
     # Cost-focused queries first
     cost_keywords = [
@@ -615,8 +777,8 @@ def build_graph():
     graph.add_node("board_foot", board_foot_node)
     graph.add_node("sheet", sheet_count_node)
     graph.add_node("cost", material_cost_node)
-    # 🔹 NEW: project info node registration
     graph.add_node("project_info", project_info_node)
+    graph.add_node("doc_search", document_search_node)
 
     # Entry point
     graph.set_entry_point("router")
@@ -627,6 +789,7 @@ def build_graph():
         route_from_text,
         {
             "project_info": "project_info",
+            "doc_search": "doc_search",  
             "board_foot": "board_foot",
             "sheet": "sheet",
             "cost": "cost",
