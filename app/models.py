@@ -13,6 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     text,
+    Float,
 )
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import relationship
@@ -43,6 +44,9 @@ class User(Base):
     messages = relationship("Message", back_populates="sender")
     ai_runs = relationship("AIRunLog", back_populates="user")
 
+    # Notifications for this user
+    notifications = relationship("Notification", back_populates="user")
+
     # Optional: invites they sent / received (used by ProjectInvite)
     sent_invites = relationship(
         "ProjectInvite",
@@ -69,6 +73,17 @@ class Project(Base):
         server_default=text("now()"),
     )
 
+    # 🔹 Location fields (for weather + mapping)
+    city = Column(String(100), nullable=True)
+    state = Column(String(100), nullable=True)
+    postal_code = Column(String(20), nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+
+    # 🔹 Blocker / on-hold status (permits, inspections, etc.)
+    is_blocked = Column(Boolean, nullable=False, default=False)
+    blocker_reason = Column(Text, nullable=True)
+
     members = relationship("ProjectMember", back_populates="project")
     messages = relationship("Message", back_populates="project")
     ai_runs = relationship("AIRunLog", back_populates="project")
@@ -78,6 +93,9 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
     )
+
+    # Notifications scoped to this project
+    notifications = relationship("Notification", back_populates="project")
 
 
 # ---------- ROLES & PERMISSIONS ----------
@@ -260,3 +278,26 @@ class ProjectDocument(Base):
 
     project = relationship("Project", backref="documents")
     created_by = relationship("User", backref="created_documents")
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(PGUUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    project_id = Column(PGUUID(as_uuid=True), ForeignKey("projects.id"), nullable=True)
+
+    # e.g. "completed_work", "new_message", "deadline", "weather_alert"
+    type = Column(String(50), nullable=False)
+    message = Column(Text, nullable=False)
+
+    is_read = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=text("now()"),
+    )
+    due_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User", back_populates="notifications")
+    project = relationship("Project", back_populates="notifications")
