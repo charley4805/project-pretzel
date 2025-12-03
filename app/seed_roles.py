@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 
 from .database import SessionLocal, engine, Base
-from . import models
+from app import models
 
 # Ensure tables exist (for safety in dev)
 Base.metadata.create_all(bind=engine)
