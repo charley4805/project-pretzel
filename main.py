@@ -1,3 +1,4 @@
+import os
 import secrets
 import asyncio
 from datetime import datetime, timezone
@@ -10,6 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from dotenv import load_dotenv  # 👈 add this
+
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
 from app.assistant_routes import router as assistant_router
 from app.database import Base, engine
 from app.deps import get_db
@@ -21,10 +27,13 @@ from app.auth_utils import (
     decode_access_token,
 )
 
-from app.graph import app_graph  
+from app.graph import app_graph
 
-
+load_dotenv()
 app = FastAPI()
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+print("Pretzel GOOGLE_CLIENT_ID:", GOOGLE_CLIENT_ID)
 
 app.include_router(assistant_router)
 
@@ -38,7 +47,7 @@ app.add_middleware(
 )
 
 # Dev-time: create tables
-Base.metadata.create_all(bind=engine)
+# --- Base.metadata.create_all(bind=engine)
 
 
 # ---------- CHAT REQUEST MODEL ----------
@@ -48,7 +57,11 @@ class ChatRequest(BaseModel):
     history: List[str] = []
     projectId: Optional[str] = None
 
+# ---------- AUTH Google ----------
 
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+    
 # ---------- AUTH HELPERS ----------
 
 def get_current_user(
@@ -127,6 +140,7 @@ def get_current_user_optional(
 
     return user
 
+
 # ---------- BASIC ROUTES ----------
 
 @app.get("/")
@@ -134,7 +148,47 @@ def root():
     return {"status": "FastAPI running"}
 
 
+# ---------- USER CRUD (profile) ----------
+
+@app.get("/users/me", response_model=schemas.UserRead)
+def get_current_user_profile(
+    current_user: models.User = Depends(get_current_user),
+):
+    return current_user
+
+
+@app.patch("/users/me", response_model=schemas.UserRead)
+def update_current_user_profile(
+    payload: schemas.UserUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Update the current user's profile (email, phone, name, password, status).
+    """
+    if payload.email is not None:
+        current_user.email = payload.email
+    if payload.phone_number is not None:
+        current_user.phone_number = payload.phone_number
+    if payload.full_name is not None:
+        current_user.full_name = payload.full_name
+    if payload.company_name is not None:
+        current_user.company_name = payload.company_name
+    if payload.is_active is not None:
+        current_user.is_active = payload.is_active
+    if payload.password is not None:
+        current_user.password_hash = hash_password(payload.password)
+
+    db.add(current_user)
+    db.commit()
+    db.refresh(current_user)
+
+    return current_user
+
+
 # ---------- ROLES & PERMISSIONS ENDPOINTS ----------
+
+# ------- PERMISSIONS CRUD -------
 
 @app.get("/permissions", response_model=List[schemas.PermissionRead])
 def list_permissions(db: Session = Depends(get_db)):
@@ -145,6 +199,100 @@ def list_permissions(db: Session = Depends(get_db)):
     )
     return perms
 
+
+@app.post("/permissions", response_model=schemas.PermissionRead)
+def create_permission(
+    payload: schemas.PermissionCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Create a new permission.
+    TODO: restrict to system admins when you add admin roles.
+    """
+    # Optional uniqueness check on key
+    existing = (
+        db.query(models.Permission)
+        .filter(models.Permission.key == payload.key)
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Permission key already exists.")
+
+    perm = models.Permission(
+        key=payload.key,
+        label=payload.label,
+        category=payload.category,
+        description=payload.description,
+    )
+    db.add(perm)
+    db.commit()
+    db.refresh(perm)
+    return perm
+
+
+@app.get("/permissions/{permission_id}", response_model=schemas.PermissionRead)
+def get_permission(
+    permission_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    perm = db.query(models.Permission).filter(models.Permission.id == permission_id).first()
+    if not perm:
+        raise HTTPException(status_code=404, detail="Permission not found.")
+    return perm
+
+
+@app.patch("/permissions/{permission_id}", response_model=schemas.PermissionRead)
+def update_permission(
+    permission_id: int,
+    payload: schemas.PermissionUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    perm = db.query(models.Permission).filter(models.Permission.id == permission_id).first()
+    if not perm:
+        raise HTTPException(status_code=404, detail="Permission not found.")
+
+    if payload.key is not None:
+        # optional uniqueness check
+        existing = (
+            db.query(models.Permission)
+            .filter(models.Permission.key == payload.key, models.Permission.id != permission_id)
+            .first()
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail="Another permission with that key already exists.")
+        perm.key = payload.key
+    if payload.label is not None:
+        perm.label = payload.label
+    if payload.category is not None:
+        perm.category = payload.category
+    if payload.description is not None:
+        perm.description = payload.description
+
+    db.add(perm)
+    db.commit()
+    db.refresh(perm)
+    return perm
+
+
+@app.delete("/permissions/{permission_id}", status_code=204)
+def delete_permission(
+    permission_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    perm = db.query(models.Permission).filter(models.Permission.id == permission_id).first()
+    if not perm:
+        raise HTTPException(status_code=404, detail="Permission not found.")
+
+    db.delete(perm)
+    db.commit()
+    return None
+
+
+# ------- ROLES CRUD -------
 
 @app.get("/roles", response_model=List[schemas.RoleWithPermissionsRead])
 def list_roles(db: Session = Depends(get_db)):
@@ -174,6 +322,109 @@ def list_roles(db: Session = Depends(get_db)):
         )
 
     return results
+
+
+@app.post("/roles", response_model=schemas.RoleRead)
+def create_role(
+    payload: schemas.RoleCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Create a new role (without permissions wiring).
+    TODO: add role-permission assignment endpoints later.
+    """
+    existing = (
+        db.query(models.Role)
+        .filter(models.Role.key == payload.key)
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Role key already exists.")
+
+    role = models.Role(
+        key=payload.key,
+        name=payload.name,
+        description=payload.description,
+        sort_order=payload.sort_order,
+    )
+    db.add(role)
+    db.commit()
+    db.refresh(role)
+    return role
+
+
+@app.get("/roles/{role_id}", response_model=schemas.RoleWithPermissionsRead)
+def get_role(
+    role_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    role = db.query(models.Role).filter(models.Role.id == role_id).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found.")
+
+    perm_objs = [rp.permission for rp in role.permissions if rp.allowed]
+
+    return schemas.RoleWithPermissionsRead(
+        id=role.id,
+        key=role.key,
+        name=role.name,
+        description=role.description,
+        sort_order=role.sort_order,
+        permissions=[
+            schemas.PermissionRead.model_validate(p)
+            for p in perm_objs
+        ],
+    )
+
+
+@app.patch("/roles/{role_id}", response_model=schemas.RoleRead)
+def update_role(
+    role_id: int,
+    payload: schemas.RoleUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    role = db.query(models.Role).filter(models.Role.id == role_id).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found.")
+
+    if payload.key is not None:
+        existing = (
+            db.query(models.Role)
+            .filter(models.Role.key == payload.key, models.Role.id != role_id)
+            .first()
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail="Another role with that key already exists.")
+        role.key = payload.key
+    if payload.name is not None:
+        role.name = payload.name
+    if payload.description is not None:
+        role.description = payload.description
+    if payload.sort_order is not None:
+        role.sort_order = payload.sort_order
+
+    db.add(role)
+    db.commit()
+    db.refresh(role)
+    return role
+
+
+@app.delete("/roles/{role_id}", status_code=204)
+def delete_role(
+    role_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    role = db.query(models.Role).filter(models.Role.id == role_id).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found.")
+
+    db.delete(role)
+    db.commit()
+    return None
 
 
 # ---------- AUTH ROUTES (email or phone + password) ----------
@@ -234,18 +485,91 @@ def login_user(payload: schemas.UserLoginRequest, db: Session = Depends(get_db))
         token_type="bearer",
         user=schemas.UserRead.model_validate(user),
     )
+    
 
-
-# ---------- CURRENT USER PROFILE ----------
-
-@app.get("/users/me", response_model=schemas.UserRead)
-def get_current_user_profile(
-    current_user: models.User = Depends(get_current_user),
+@app.post("/auth/google", response_model=schemas.TokenResponse)
+def google_login(
+    payload: GoogleAuthRequest,
+    db: Session = Depends(get_db),
 ):
-    return current_user
+    if not GOOGLE_CLIENT_ID:
+        # Explicit 500 with clear message
+        raise HTTPException(
+            status_code=500,
+            detail="Google auth not configured on server (GOOGLE_CLIENT_ID is missing).",
+        )
+
+    # 1) Verify token with Google
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            payload.id_token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except Exception as exc:
+        print("Error verifying Google ID token:", repr(exc))
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Google ID token.",
+        )
+
+    email = idinfo.get("email")
+    email_verified = idinfo.get("email_verified", False)
+    full_name = idinfo.get("name")
+
+    if not email or not email_verified:
+        raise HTTPException(
+            status_code=400,
+            detail="Google account email is not verified.",
+        )
+
+    # 2) Find or create user
+    try:
+        user = (
+            db.query(models.User)
+            .filter(models.User.email == email)
+            .first()
+        )
+
+        if not user:
+            user = models.User(
+                email=email,
+                full_name=full_name,
+                password_hash="",
+                is_active=True,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        if not user.is_active:
+            raise HTTPException(
+                status_code=403,
+                detail="User is inactive.",
+            )
+
+        # 3) Issue JWT
+        access_token = create_access_token(str(user.id))
+
+        return schemas.TokenResponse(
+            access_token=access_token,
+            token_type="bearer",
+            user=schemas.UserRead.model_validate(user),
+        )
+
+    except HTTPException:
+        # Let our explicit HTTP errors pass through
+        raise
+    except Exception as exc:
+        # Log and wrap any DB/pydantic issues
+        print("Unexpected error in /auth/google:", repr(exc))
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error during Google login.",
+        )
 
 
-# ---------- PROJECT CREATION ----------
+# ---------- PROJECT CREATION / CRUD ----------
 
 @app.post("/projects", response_model=schemas.ProjectWithRoleSummary)
 def create_project(
@@ -297,8 +621,6 @@ def create_project(
     )
 
 
-# ---------- "MY PROJECTS" DASHBOARD ----------
-
 @app.get("/projects", response_model=List[schemas.ProjectWithRoleSummary])
 def list_my_projects(
     db: Session = Depends(get_db),
@@ -328,8 +650,6 @@ def list_my_projects(
 
     return results
 
-
-# ---------- SINGLE PROJECT (WITH MY ROLE) ----------
 
 @app.get("/projects/{project_id}", response_model=schemas.ProjectWithRoleSummary)
 def get_project(
@@ -370,7 +690,94 @@ def get_project(
     )
 
 
-# ---------- PROJECT MEMBERS LIST ----------
+@app.patch("/projects/{project_id}", response_model=schemas.ProjectWithRoleSummary)
+def update_project(
+    project_id: UUID,
+    payload: schemas.ProjectUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Update a project (PM only).
+    """
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    # Ensure caller is PM on this project
+    membership = (
+        db.query(models.ProjectMember)
+        .join(models.Role, models.ProjectMember.role_id == models.Role.id)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not membership or not membership.role or membership.role.key != "PROJECT_MANAGER":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the Project Manager can update this project.",
+        )
+
+    if payload.name is not None:
+        project.name = payload.name
+    if payload.description is not None:
+        project.description = payload.description
+    if payload.status is not None:
+        project.status = payload.status
+
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+
+    pm_role = membership.role
+
+    return schemas.ProjectWithRoleSummary(
+        project_id=project.id,
+        project_name=project.name,
+        description=project.description,
+        status=project.status,
+        role_key=pm_role.key,
+        role_name=pm_role.name,
+    )
+
+
+@app.delete("/projects/{project_id}", status_code=204)
+def delete_project(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Delete a project (PM only).
+    """
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    # Ensure caller is PM
+    membership = (
+        db.query(models.ProjectMember)
+        .join(models.Role, models.ProjectMember.role_id == models.Role.id)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not membership or not membership.role or membership.role.key != "PROJECT_MANAGER":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the Project Manager can delete this project.",
+        )
+
+    db.delete(project)
+    db.commit()
+    return None
+
+
+# ---------- PROJECT MEMBERS LIST + CRUD ----------
 
 @app.get(
     "/projects/{project_id}/members",
@@ -421,6 +828,193 @@ def list_project_members(
         )
 
     return members
+
+
+@app.post(
+    "/projects/{project_id}/members",
+    response_model=schemas.ProjectMemberRead,
+)
+def add_project_member(
+    project_id: UUID,
+    payload: schemas.ProjectMemberCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    PM-only direct member add (bypassing invite flow).
+    """
+    if project_id != payload.project_id:
+        raise HTTPException(status_code=400, detail="Project ID mismatch.")
+
+    # Ensure caller is PM
+    membership = (
+        db.query(models.ProjectMember)
+        .join(models.Role, models.ProjectMember.role_id == models.Role.id)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not membership or not membership.role or membership.role.key != "PROJECT_MANAGER":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the Project Manager can add members.",
+        )
+
+    # Ensure user exists
+    user = db.query(models.User).filter(models.User.id == payload.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    # Resolve role (optional)
+    role_id = None
+    role_key = None
+    if payload.role_key:
+        role = db.query(models.Role).filter(models.Role.key == payload.role_key).first()
+        if not role:
+            raise HTTPException(status_code=400, detail="Invalid role_key.")
+        role_id = role.id
+        role_key = role.key
+
+    # Check if already a member
+    existing_member = (
+        db.query(models.ProjectMember)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == payload.user_id,
+        )
+        .first()
+    )
+    if existing_member:
+        raise HTTPException(status_code=400, detail="User is already a member of this project.")
+
+    member = models.ProjectMember(
+        project_id=project_id,
+        user_id=payload.user_id,
+        role_id=role_id,
+    )
+    db.add(member)
+    db.commit()
+    db.refresh(member)
+
+    return schemas.ProjectMemberRead(
+        id=member.id,
+        project_id=member.project_id,
+        user_id=member.user_id,
+        role_key=role_key,
+    )
+
+
+@app.patch(
+    "/projects/{project_id}/members/{member_id}",
+    response_model=schemas.ProjectMemberRead,
+)
+def update_project_member(
+    project_id: UUID,
+    member_id: int,
+    payload: schemas.ProjectMemberUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Update a project member's role (PM only).
+    """
+    # Ensure caller is PM
+    membership = (
+        db.query(models.ProjectMember)
+        .join(models.Role, models.ProjectMember.role_id == models.Role.id)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not membership or not membership.role or membership.role.key != "PROJECT_MANAGER":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the Project Manager can update members.",
+        )
+
+    member = (
+        db.query(models.ProjectMember)
+        .filter(
+            models.ProjectMember.id == member_id,
+            models.ProjectMember.project_id == project_id,
+        )
+        .first()
+    )
+    if not member:
+        raise HTTPException(status_code=404, detail="Project member not found.")
+
+    role_key = None
+    if payload.role_key is not None:
+        role = db.query(models.Role).filter(models.Role.key == payload.role_key).first()
+        if not role:
+            raise HTTPException(status_code=400, detail="Invalid role_key.")
+        member.role_id = role.id
+        role_key = role.key
+    else:
+        # Keep existing role
+        if member.role_id:
+            role = db.query(models.Role).filter(models.Role.id == member.role_id).first()
+            role_key = role.key if role else None
+
+    db.add(member)
+    db.commit()
+    db.refresh(member)
+
+    return schemas.ProjectMemberRead(
+        id=member.id,
+        project_id=member.project_id,
+        user_id=member.user_id,
+        role_key=role_key,
+    )
+
+
+@app.delete(
+    "/projects/{project_id}/members/{member_id}",
+    status_code=204,
+)
+def remove_project_member(
+    project_id: UUID,
+    member_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Remove a project member (PM only).
+    """
+    # Ensure caller is PM
+    membership = (
+        db.query(models.ProjectMember)
+        .join(models.Role, models.ProjectMember.role_id == models.Role.id)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not membership or not membership.role or membership.role.key != "PROJECT_MANAGER":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the Project Manager can remove members.",
+        )
+
+    member = (
+        db.query(models.ProjectMember)
+        .filter(
+            models.ProjectMember.id == member_id,
+            models.ProjectMember.project_id == project_id,
+        )
+        .first()
+    )
+    if not member:
+        raise HTTPException(status_code=404, detail="Project member not found.")
+
+    db.delete(member)
+    db.commit()
+    return None
 
 
 # ---------- INVITE CREATION (PM only) ----------
@@ -743,6 +1337,7 @@ def approve_invite_and_assign_role(
         message=f'User "{user.full_name or user.email or user.phone_number}" has been added to project "{project.name}" as {role.name}.',
     )
 
+
 # ---------- PROJECT DOCUMENTS (for RAG) ----------
 
 @app.post(
@@ -846,6 +1441,159 @@ def list_project_documents(
     return [schemas.ProjectDocumentRead.model_validate(d) for d in docs]
 
 
+@app.get(
+    "/projects/{project_id}/documents/{document_id}",
+    response_model=schemas.ProjectDocumentRead,
+)
+def get_project_document(
+    project_id: UUID,
+    document_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Get a single project document.
+    """
+    # Ensure caller is a member
+    membership = (
+        db.query(models.ProjectMember)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not membership:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not a member of this project.",
+        )
+
+    doc = (
+        db.query(models.ProjectDocument)
+        .filter(
+            models.ProjectDocument.id == document_id,
+            models.ProjectDocument.project_id == project_id,
+        )
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    return schemas.ProjectDocumentRead.model_validate(doc)
+
+
+@app.patch(
+    "/projects/{project_id}/documents/{document_id}",
+    response_model=schemas.ProjectDocumentRead,
+)
+def update_project_document(
+    project_id: UUID,
+    document_id: UUID,
+    payload: schemas.ProjectDocumentUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Update a project document (PM only).
+    """
+    # Ensure project & membership
+    membership_row = (
+        db.query(models.ProjectMember, models.Role)
+        .outerjoin(models.Role, models.ProjectMember.role_id == models.Role.id)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not membership_row:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not a member of this project.",
+        )
+
+    membership, role = membership_row
+    if not role or role.key != "PROJECT_MANAGER":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the Project Manager can update documents for this project.",
+        )
+
+    doc = (
+        db.query(models.ProjectDocument)
+        .filter(
+            models.ProjectDocument.id == document_id,
+            models.ProjectDocument.project_id == project_id,
+        )
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    if payload.title is not None:
+        doc.title = payload.title
+    if payload.content is not None:
+        doc.content = payload.content
+
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+
+    return schemas.ProjectDocumentRead.model_validate(doc)
+
+
+@app.delete(
+    "/projects/{project_id}/documents/{document_id}",
+    status_code=204,
+)
+def delete_project_document(
+    project_id: UUID,
+    document_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Delete a project document (PM only).
+    """
+    membership_row = (
+        db.query(models.ProjectMember, models.Role)
+        .outerjoin(models.Role, models.ProjectMember.role_id == models.Role.id)
+        .filter(
+            models.ProjectMember.project_id == project_id,
+            models.ProjectMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not membership_row:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not a member of this project.",
+        )
+
+    membership, role = membership_row
+    if not role or role.key != "PROJECT_MANAGER":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the Project Manager can delete documents for this project.",
+        )
+
+    doc = (
+        db.query(models.ProjectDocument)
+        .filter(
+            models.ProjectDocument.id == document_id,
+            models.ProjectDocument.project_id == project_id,
+        )
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    db.delete(doc)
+    db.commit()
+    return None
+
+
 # ---------- CHAT HELPERS (LangGraph glue) ----------
 
 def append_user_turn(history: List[str], user_message: str) -> List[str]:
@@ -870,8 +1618,6 @@ def extract_latest_assistant_reply(messages: List[str]) -> str:
     # Fallback if something unexpected happens
     return "Sorry, I couldn't generate a response."
 
-
-# ---------- CHAT ROUTE (role-aware + LangGraph) ----------
 
 # ---------- CHAT ROUTE (role-aware + LangGraph) ----------
 
@@ -1045,5 +1791,3 @@ async def chat_stream(
             await asyncio.sleep(0)
 
     return StreamingResponse(text_stream(), media_type="text/plain; charset=utf-8")
-
-

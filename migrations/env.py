@@ -9,6 +9,7 @@ from sqlalchemy.engine import Connection
 
 # Make sure this import path matches your app layout
 from app.database import Base, engine  # ← your SQLAlchemy Base + Engine
+from app import models
 
 # ---------- ALEMBIC CONFIG ----------
 

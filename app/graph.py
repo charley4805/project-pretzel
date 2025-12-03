@@ -2,6 +2,8 @@ import os
 import re
 import math
 from typing import TypedDict, List, Optional, Dict, Any
+import uuid
+from uuid import UUID
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -30,10 +32,11 @@ class ChatState(TypedDict):
     messages: List[str]
     # Active project this chat is about (UUID as string)
     projectId: Optional[str]
-    # 🔹 NEW: who is asking
+    # who is asking
     userId: Optional[str]
-    # 🔹 NEW: their role in that project (e.g., "PROJECT_MANAGER")
+    # their role in that project (e.g., "PROJECT_MANAGER")
     roleKey: Optional[str]
+
 
 # Create LLM client (shared by all nodes)
 llm = ChatOpenAI(
@@ -113,7 +116,12 @@ def construction_measurement_node(state: ChatState) -> ChatState:
         )
 
     new_messages = state["messages"] + [f"ASSISTANT: {reply}"]
-    return {"messages": new_messages, "projectId": state.get("projectId")}
+    return {
+        "messages": new_messages,
+        "projectId": state.get("projectId"),
+        "userId": state.get("userId"),
+        "roleKey": state.get("roleKey"),
+    }
 
 
 # ---------- Board-Foot Helper ----------
@@ -204,7 +212,12 @@ def board_foot_node(state: ChatState) -> ChatState:
         )
 
     new_messages = state["messages"] + [f"ASSISTANT: {reply}"]
-    return {"messages": new_messages, "projectId": state.get("projectId")}
+    return {
+        "messages": new_messages,
+        "projectId": state.get("projectId"),
+        "userId": state.get("userId"),
+        "roleKey": state.get("roleKey"),
+    }
 
 
 # ---------- Sheet Count Helper (Tool 1) ----------
@@ -293,7 +306,12 @@ def sheet_count_node(state: ChatState) -> ChatState:
         )
 
     new_messages = state["messages"] + [f"ASSISTANT: {reply}"]
-    return {"messages": new_messages, "projectId": state.get("projectId")}
+    return {
+        "messages": new_messages,
+        "projectId": state.get("projectId"),
+        "userId": state.get("userId"),
+        "roleKey": state.get("roleKey"),
+    }
 
 
 # ---------- Material Cost Estimator (Tool 5) ----------
@@ -449,28 +467,128 @@ def material_cost_node(state: ChatState) -> ChatState:
     }
 
 
-# ---------- Assistant Node (general chat) ----------
+# ---------- Project Document RAG Helpers ----------
+
+def _fetch_project_documents(project_id: str) -> List[ProjectDocument]:
+    """
+    Load all documents for a given project UUID string.
+    Returns an empty list if project_id is invalid or no docs exist.
+    """
+    try:
+        project_uuid = UUID(project_id)
+    except (ValueError, TypeError):
+        return []
+
+    db: Session = SessionLocal()
+    try:
+        docs = (
+            db.query(ProjectDocument)
+            .filter(ProjectDocument.project_id == project_uuid)
+            .order_by(ProjectDocument.created_at.desc())
+            .all()
+        )
+        return docs
+    finally:
+        db.close()
+
+
+def _score_doc_relevance(doc: ProjectDocument, query: str) -> int:
+    """
+    Very simple relevance scoring:
+    - tokenizes the query
+    - counts how many query tokens appear in title+content (case-insensitive)
+    """
+    query_tokens = set(re.findall(r"\w+", query.lower()))
+    if not query_tokens:
+        return 0
+
+    text = f"{doc.title}\n{doc.content}".lower()
+    score = 0
+    for token in query_tokens:
+        if token in text:
+            score += 1
+    return score
+
+
+def _get_top_project_docs(
+    project_id: Optional[str],
+    question: str,
+    k: int = 3,
+) -> List[tuple[str, str]]:
+    """
+    Return up to k (title, content) tuples of the most relevant docs
+    for this project + question, using the simple keyword-overlap scorer.
+    """
+    if not project_id:
+        return []
+
+    docs = _fetch_project_documents(project_id)
+    if not docs:
+        return []
+
+    scored: List[tuple[int, ProjectDocument]] = []
+    for d in docs:
+        score = _score_doc_relevance(d, question)
+        if score > 0:
+            scored.append((score, d))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    top_docs = [d for _, d in scored[:k]]
+    return [(d.title, d.content) for d in top_docs]
+
+
+# ---------- Assistant Node (general chat with project RAG) ----------
 
 def assistant_node(state: ChatState) -> ChatState:
     """
     General assistant powered by the LLM.
+
+    If a projectId is present in the state, it will:
+      - fetch project documents
+      - select the most relevant ones
+      - pass them into the LLM as context for RAG-style answers
     """
     last = state["messages"][-1]
     if last.lower().startswith("user:"):
-        text = last[5:].strip()
+        user_text = last[5:].strip()
     else:
-        text = last
+        user_text = last
 
-    response = llm.invoke(text)
+    project_id = state.get("projectId")
+
+    # --- RAG: pull relevant project docs, if any ---
+    top_docs = _get_top_project_docs(project_id, user_text, k=3)
+
+    if top_docs:
+        docs_block = "\n\n".join(
+            f"[Document: {title}]\n{content}"
+            for title, content in top_docs
+        )
+        prompt = (
+            "You are a construction/project assistant. Use the project documents below "
+            "if they are relevant to the user's question. If they are not relevant, "
+            "answer from your own knowledge but do NOT invent project-specific facts.\n\n"
+            f"{docs_block}\n\n"
+            f"User question: {user_text}"
+        )
+    else:
+        prompt = user_text
+
+    response = llm.invoke(prompt)
     ai_reply = response.content
 
     return {
         "messages": state["messages"] + [f"ASSISTANT: {ai_reply}"],
-        "projectId": state.get("projectId"),
+        "projectId": project_id,
+        "userId": state.get("userId"),
+        "roleKey": state.get("roleKey"),
     }
 
 
-# ---------- 🔹 NEW: Project Info Node ----------
+# ---------- Project Info Node ----------
 
 def project_info_node(state: ChatState) -> ChatState:
     """
@@ -479,24 +597,38 @@ def project_info_node(state: ChatState) -> ChatState:
       - PROJECT_MANAGER: full overview including members
       - Others: basic project info, limited team details
     """
-    project_id = state.get("projectId")
+    project_id_str = state.get("projectId")
     role_key = state.get("roleKey")
 
-    if not project_id:
+    if not project_id_str:
         reply = (
             "I can summarize the project, but no projectId was provided. "
             "Try asking again from inside an active project."
         )
         return {
             "messages": state["messages"] + [f"ASSISTANT: {reply}"],
-            "projectId": project_id,
+            "projectId": project_id_str,
+            "userId": state.get("userId"),
+            "roleKey": role_key,
+        }
+
+    try:
+        project_uuid = UUID(project_id_str)
+    except (ValueError, TypeError):
+        reply = (
+            "I tried to look up this project, but the projectId format seems invalid. "
+            "Please try again from an active project."
+        )
+        return {
+            "messages": state["messages"] + [f"ASSISTANT: {reply}"],
+            "projectId": project_id_str,
             "userId": state.get("userId"),
             "roleKey": role_key,
         }
 
     db: Session = SessionLocal()
     try:
-        project = db.query(Project).filter(Project.id == project_id).first()
+        project = db.query(Project).filter(Project.id == project_uuid).first()
         if not project:
             reply = (
                 "I looked for that project in the database, but couldn't find it. "
@@ -504,7 +636,7 @@ def project_info_node(state: ChatState) -> ChatState:
             )
             return {
                 "messages": state["messages"] + [f"ASSISTANT: {reply}"],
-                "projectId": project_id,
+                "projectId": project_id_str,
                 "userId": state.get("userId"),
                 "roleKey": role_key,
             }
@@ -512,7 +644,7 @@ def project_info_node(state: ChatState) -> ChatState:
         # Fetch members
         project_members = (
             db.query(ProjectMember)
-            .filter(ProjectMember.project_id == project_id)
+            .filter(ProjectMember.project_id == project_uuid)
             .all()
         )
 
@@ -550,10 +682,11 @@ def project_info_node(state: ChatState) -> ChatState:
 
     return {
         "messages": state["messages"] + [f"ASSISTANT: {reply}"],
-        "projectId": project_id,
+        "projectId": project_id_str,
         "userId": state.get("userId"),
         "roleKey": role_key,
     }
+
 
 def document_search_node(state: ChatState) -> ChatState:
     """
@@ -563,7 +696,7 @@ def document_search_node(state: ChatState) -> ChatState:
     - Searches title/content with a simple ILIKE text search
     - Feeds top matches into the LLM along with the user's question
     """
-    project_id = state.get("projectId")
+    project_id_str = state.get("projectId")
     role_key = state.get("roleKey")
     user_id = state.get("userId")
 
@@ -573,14 +706,28 @@ def document_search_node(state: ChatState) -> ChatState:
     else:
         query_text = last
 
-    if not project_id:
+    if not project_id_str:
         reply = (
             "I can search project documents, but no projectId was provided. "
             "Try asking again from inside an active project."
         )
         return {
             "messages": state["messages"] + [f"ASSISTANT: {reply}"],
-            "projectId": project_id,
+            "projectId": project_id_str,
+            "userId": user_id,
+            "roleKey": role_key,
+        }
+
+    try:
+        project_uuid = UUID(project_id_str)
+    except (ValueError, TypeError):
+        reply = (
+            "I tried to look up this project's documents, but the projectId format "
+            "seems invalid. Please try again from an active project."
+        )
+        return {
+            "messages": state["messages"] + [f"ASSISTANT: {reply}"],
+            "projectId": project_id_str,
             "userId": user_id,
             "roleKey": role_key,
         }
@@ -590,7 +737,7 @@ def document_search_node(state: ChatState) -> ChatState:
         # Basic text search against project documents
         q = (
             db.query(ProjectDocument)
-            .filter(ProjectDocument.project_id == project_id)
+            .filter(ProjectDocument.project_id == project_uuid)
             .filter(
                 (ProjectDocument.title.ilike(f"%{query_text}%"))
                 | (ProjectDocument.content.ilike(f"%{query_text}%"))
@@ -608,7 +755,7 @@ def document_search_node(state: ChatState) -> ChatState:
             )
             return {
                 "messages": state["messages"] + [f"ASSISTANT: {reply}"],
-                "projectId": project_id,
+                "projectId": project_id_str,
                 "userId": user_id,
                 "roleKey": role_key,
             }
@@ -638,7 +785,7 @@ def document_search_node(state: ChatState) -> ChatState:
 
         return {
             "messages": state["messages"] + [f"ASSISTANT: {ai_reply}"],
-            "projectId": project_id,
+            "projectId": project_id_str,
             "userId": user_id,
             "roleKey": role_key,
         }
@@ -667,6 +814,7 @@ def route_from_text(state: ChatState) -> str:
         "sheet"        -> sheet_count_node
         "cost"         -> material_cost_node
         "measure"      -> construction_measurement_node
+        "doc_search"   -> document_search_node
         "chat"         -> assistant_node
     """
     last = state["messages"][-1]
@@ -675,7 +823,7 @@ def route_from_text(state: ChatState) -> str:
     else:
         text = last.lower()
 
-    # 🔹 NEW: Project-related questions
+    # Project-related questions
     project_keywords = [
         "project overview",
         "project summary",
@@ -690,6 +838,7 @@ def route_from_text(state: ChatState) -> str:
     if any(k in text for k in project_keywords):
         return "project_info"
 
+    # Document / specs questions
     doc_keywords = [
         "spec",
         "specs",
@@ -707,7 +856,7 @@ def route_from_text(state: ChatState) -> str:
     if any(k in text for k in doc_keywords):
         return "doc_search"
 
-    # Cost-focused queries first
+    # Cost-focused queries
     cost_keywords = [
         "cost",
         "price",
@@ -789,7 +938,7 @@ def build_graph():
         route_from_text,
         {
             "project_info": "project_info",
-            "doc_search": "doc_search",  
+            "doc_search": "doc_search",
             "board_foot": "board_foot",
             "sheet": "sheet",
             "cost": "cost",
@@ -800,6 +949,7 @@ def build_graph():
 
     # Terminal edges
     graph.add_edge("project_info", END)
+    graph.add_edge("doc_search", END)
     graph.add_edge("board_foot", END)
     graph.add_edge("sheet", END)
     graph.add_edge("cost", END)

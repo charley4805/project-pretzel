@@ -1,7 +1,8 @@
+# app/deps.py
 from typing import Generator, Optional
 from uuid import UUID
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
@@ -34,7 +35,9 @@ def get_current_user(
 
     parts = authorization.split()
     if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Invalid Authorization header format.")
+        raise HTTPException(
+            status_code=401, detail="Invalid Authorization header format."
+        )
 
     token = parts[1]
     payload = decode_access_token(token)
@@ -46,11 +49,7 @@ def get_current_user(
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid token subject.")
 
-    user = (
-        db.query(models.User)
-        .filter(models.User.id == user_id)
-        .first()
-    )
+    user = db.query(models.User).filter(models.User.id == user_id).first()
 
     if not user:
         raise HTTPException(status_code=401, detail="User not found.")
